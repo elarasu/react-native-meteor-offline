@@ -9,56 +9,39 @@ import EventEmitter from 'events';
 import { persistStore, autoRehydrate } from 'redux-persist';
 
 const meteorReduxReducers = (
-  state = { reactNativeMeteorOfflineRecentlyAdded: {} },
+  state = { reactNativeMeteorOfflineRecentlyAdded: [] },
   action
 ) => {
-  const { type, collection, id, fields } = action;
+  const { type, collection, id, fields, cleared } = action;
+  // console.log(type);
   switch (type) {
-    case 'SET_USRID': {
-      const newState = _.clone(state);
-      newState.userId = id;
-      return newState;
+    case 'SET_USERID': {
+      return { ...state, userId: id };
     }
     case 'RECENTLY_ADDED': {
-      const newState = _.clone(state);
-      _.set(
-        newState,
-        `reactNativeMeteorOfflineRecentlyAdded.${collection}`,
-        _.get(
-          newState,
-          `reactNativeMeteorOfflineRecentlyAdded.${collection}`,
-          []
-        )
-      );
-      newState.reactNativeMeteorOfflineRecentlyAdded[collection].push(id);
-      return newState;
+      return {
+        ...state,
+        reactNativeMeteorOfflineRecentlyAdded: [
+          ...(state.reactNativeMeteorOfflineRecentlyAdded || []),
+          id,
+        ],
+      };
     }
     case 'ADDED': {
-      let newState;
-      if (!state[collection]) {
-        // collection doesn't exist yet, add it with doc and 'new' flag
-        newState = _.clone(state);
-        newState[collection] = { [id]: fields };
-        return newState;
-      } else if (!state[collection][id]) {
-        // no doc with _id exists yet, add it
-        newState = _.clone(state);
-        newState[collection][id] = fields;
-        return newState;
-      } else if (state[collection] && state[collection][id]) {
-        // duplicate found, update it
-        // console.warn(`${id} not added to ${collection}, duplicate found`);
-        if (_.isEqual(state[collection][id], fields)) return state;
-        newState = _.clone(state);
-        newState[collection][id] = { ...state[collection][id], ...fields };
-        return newState;
-      }
-      return state;
+      // doc and/or collection don't exist yet, add them
+      if (_.isEqual(_.get(state, `${collection}.${id}`, {}), fields)) return state;
+      return {
+        ...state,
+        [collection]: { ...state[collection], [id]: fields },
+      };
     }
     case 'CHANGED': {
-      const newState = _.clone(state);
-      newState[collection][id] = _.merge(state[collection][id], fields);
-      return newState;
+      // something's changed, add/update
+      if (cleared.length) {
+        const nextDoc = _.omit(state[collection][id], cleared);
+        return { ...state, [collection]: { ...state[collection], [id]: nextDoc } };
+      } else if (_.isEqual(_.get(state, `${collection}.${id}`), fields)) return state;
+      return { ...state, [collection]: { ...state[collection], [id]: fields } };
     }
     case 'REMOVED':
       if (state[collection][id]) {
@@ -77,12 +60,15 @@ const meteorReduxReducers = (
     case 'REMOVE_AFTER_RECONNECT':
       // todo: check for removed docs
       const { removed } = action;
-      const newState = _.clone(state);
-      _.set(newState, `reactNativeMeteorOfflineRecentlyAdded.${collection}`, []);
-      newState[collection] = _.omit(newState[collection], removed);
-      console.log('collection now contains ', _.size(newState[collection]));
+      const withoutRemoved = _.omit(
+        state.reactNativeMeteorOfflineRecentlyAdded,
+        removed
+      );
       getData().db[collection].remove({ _id: { $in: removed } });
-      return newState;
+      return {
+        ...state,
+        reactNativeMeteorOfflineRecentlyAdded: withoutRemoved,
+      };
     case 'persist/REHYDRATE':
       if (
         typeof Meteor.ddp === 'undefined' ||
@@ -145,18 +131,15 @@ const initMeteorRedux = (
       connected = false;
     });
     if (connected) {
-      Meteor.ddp.on('removed', (obj) => {
-        const { collection, id } = obj;
-        const fields = obj.fields || {};
+      Meteor.ddp.on('removed', ({ collection, id, fields = {} }) => {
         MeteorStore.dispatch({ type: 'REMOVED', collection, id, fields });
       });
-      Meteor.ddp.on('changed', (obj) => {
-        const { collection, id } = obj;
-        const fields = obj.fields || {};
-        MeteorStore.dispatch({ type: 'CHANGED', collection, id, fields });
+      Meteor.ddp.on('changed', ({ collection, id, fields = {}, cleared = [] }) => {
+        MeteorStore.dispatch({ type: 'CHANGED', collection, id, fields, cleared });
       });
       Meteor.ddp.on('added', (obj, ...args) => {
         const { collection, id } = obj;
+        // console.log('added', obj, args);
         const fields = obj.fields || {};
         fields._id = id;
         const getCollection = MeteorStore.getState()[collection];
@@ -168,7 +151,7 @@ const initMeteorRedux = (
           // don't insert if it exists
           MeteorStore.dispatch({ type: 'ADDED', collection, id, fields });
         }
-        MeteorStore.dispatch({ type: 'RECENTLY_ADDED', collection, id });
+        MeteorStore.dispatch({ type: 'RECENTLY_ADDED', id });
       });
     }
   });
@@ -236,6 +219,11 @@ class MeteorOffline {
       }
     });
   }
+
+  subReady (uniqueName) {
+    return this.subscriptions[uniqueName].ready && !this.offline;
+  }
+
   user() {
     if (Meteor.user()) {
       this.store.dispatch({ type: 'SET_USERID', id: Meteor.userId() });
@@ -244,11 +232,16 @@ class MeteorOffline {
     const { userId } = this.store.getState();
     return Meteor.collection('users').findOne(userId);
   }
+
   subscribe(uniqueName, name, ...params) {
     const hasCallback = typeof params[params.length - 1] === 'function';
     const justParams = params.slice(0, params.length - 1);
     _.set(this.subscriptions, `${uniqueName}.${name}`, name);
-    _.set(this.subscriptions, `${uniqueName}.${params}`, JSON.stringify(justParams));
+    _.set(
+      this.subscriptions,
+      `${uniqueName}.${params}`,
+      JSON.stringify(justParams)
+    );
     let subHandle = Meteor.subscribe(name, ...params);
     if (this.offline) {
       subHandle = {
@@ -260,7 +253,12 @@ class MeteorOffline {
       };
     }
     // run callback if it's offline and ready for the first time
-    if (this.offline && hasCallback && this.store.getState().ready && !this.subscriptions[uniqueName].ready) {
+    if (
+      this.offline &&
+      hasCallback &&
+      this.store.getState().ready &&
+      !this.subscriptions[uniqueName].ready
+    ) {
       // handled by meteor.subscribe if online
       const callback = _.once(params[params.length - 1]);
       callback();
@@ -268,24 +266,24 @@ class MeteorOffline {
     this.subscriptions[uniqueName].ready = subHandle.ready();
     return subHandle;
   }
+
   collection(collection, subscriptionName) {
     if (
-      Meteor.status().connected &&  
+      Meteor.status().connected &&
       this.firstConnection &&
       _.get(this.subscriptions, `${subscriptionName}.ready`)
     ) {
       this.firstConnection = false;
-      // const t = new Date();
-      const added = _.sortBy(
-        _.get(this.store.getState(), `reactNativeMeteorOfflineRecentlyAdded.${collection}`)
-      );
-      const cached = _.sortBy(_.keys(this.store.getState()[collection]));
+      const t = new Date();
+      const recentlyAddedIds = this.store.getState()
+        .reactNativeMeteorOfflineRecentlyAdded;
+      const cachedIds = _.sortBy(_.keys(this.store.getState()[collection]));
       // console.log(`got cached in ${new Date() - t}ms`);
-      const removed = _.sortBy(_.difference(cached, added)) || [];
+      const removed = _.sortBy(_.difference(cachedIds, recentlyAddedIds)) || [];
       // console.log(
       //   `got difference in ${new Date() - t}ms`,
-      //   added,
-      //   cached,
+      //   recentlyAddedIds,
+      //   cachedIds,
       //   removed,
       //   this.store.getState().reactNativeMeteorOfflineRecentlyAdded
       // );
